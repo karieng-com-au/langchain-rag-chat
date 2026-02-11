@@ -1,4 +1,5 @@
 import os
+import re
 from contextlib import AsyncExitStack
 
 import chainlit as cl
@@ -9,7 +10,19 @@ from httpx import ASGITransport
 
 # from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    PIIMiddleware,
+    ToolCallLimitMiddleware,
+    ModelCallLimitMiddleware,
+    before_agent,
+    before_model,
+    after_model,
+    AgentState,
+)
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.runtime import Runtime
 from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool, tool
 from langchain_community.tools import DuckDuckGoSearchResults
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -19,6 +32,174 @@ from mcp.client.streamable_http import streamable_http_client
 from main_api import app
 
 load_dotenv()
+
+# ── Guardrail constants ─────────────────────────────────────────────────
+
+NUTRITION_KEYWORDS = {
+    "food", "meal", "breakfast", "lunch", "dinner", "snack", "brunch",
+    "calorie", "calories", "kcal", "nutrition", "nutrient", "nutrients",
+    "diet", "dietary", "healthy", "health", "wellness",
+    "bmi", "weight", "obesity", "overweight", "underweight",
+    "protein", "carb", "carbs", "carbohydrate", "fat", "fats", "fiber",
+    "vitamin", "mineral", "sodium", "cholesterol", "sugar", "glucose",
+    "recipe", "ingredient", "ingredients", "cook", "cooking",
+    "vegan", "vegetarian", "keto", "paleo", "gluten",
+    "egg", "eggs", "milk", "bread", "fruit", "fruits",
+    "vegetable", "vegetables", "meat", "chicken", "fish", "rice",
+    "grocery", "groceries", "price", "cost", "cheap", "affordable",
+    "organic", "serving", "portion", "hydration", "water",
+    "supplement", "iron", "calcium", "zinc", "omega",
+    "allergy", "allergies", "intolerance", "lactose", "celiac",
+}
+
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|rules?)",
+    r"ignore\s+everything\s+(above|before|previously)",
+    r"disregard\s+(all\s+)?(previous|prior|your)\s+(instructions?|prompts?|rules?)",
+    r"forget\s+(all\s+)?(previous|prior|your)\s+(instructions?|prompts?|rules?)",
+    r"you\s+are\s+now\s+(?:a|an)\s+",
+    r"new\s+instructions?\s*:",
+    r"system\s*:\s*",
+    r"<\s*system\s*>",
+    r"\[system\]",
+    r"act\s+as\s+(?:if|though)\s+(?:you\s+(?:are|were)|your\s+(?:instructions?|rules?))",
+    r"pretend\s+(?:you\s+are|your\s+instructions?)",
+    r"override\s+(?:your\s+)?(?:instructions?|rules?|system\s*prompt)",
+    r"jailbreak",
+    r"do\s+anything\s+now",
+    r"DAN\s+mode",
+]
+
+HARMFUL_CONTENT_PATTERNS = [
+    r"(?:extreme|crash|starvation)\s+diet",
+    r"(?:purging|laxative|diuretic)\s+(?:for|to)\s+(?:lose|weight)",
+    r"eat\s+(?:nothing|zero\s+calories)",
+]
+
+MEDICAL_ADVICE_PATTERNS = [
+    r"you\s+should\s+(?:take|stop\s+taking)\s+(?:medication|medicine|drug|supplement)",
+    r"(?:diagnos|treat|cure|prescribe)",
+]
+
+FRIENDLY_REJECTION = (
+    "I'm a nutrition and healthy eating assistant. I can help you with:\n\n"
+    "- Planning healthy meals (especially breakfast!)\n"
+    "- Looking up calories for foods and recipes\n"
+    "- Calculating your BMI\n"
+    "- Finding grocery prices for meal ingredients\n"
+    "- Answering nutrition and health questions\n\n"
+    "Could you ask me something related to these topics?"
+)
+
+INJECTION_REJECTION = (
+    "I detected a prompt that appears to be trying to override my instructions. "
+    "I'm here to help with nutrition and healthy eating topics. "
+    "Please ask me a genuine nutrition question!"
+)
+
+HARMFUL_CONTENT_REPLACEMENT = (
+    "I can't provide advice on extreme or potentially harmful dietary practices. "
+    "For safe and healthy nutrition guidance, please consult a registered dietitian "
+    "or healthcare professional."
+)
+
+MEDICAL_DISCLAIMER = (
+    "\n\n---\n*Disclaimer: This is general nutrition information, not medical advice. "
+    "Please consult a healthcare professional for personalized dietary guidance.*"
+)
+
+GUARDRAIL_MESSAGES = {FRIENDLY_REJECTION, INJECTION_REJECTION, HARMFUL_CONTENT_REPLACEMENT}
+
+# ── Custom middleware ────────────────────────────────────────────────────
+
+@before_agent(can_jump_to=["end"])
+def topic_guardrail(state: AgentState, runtime: Runtime) -> dict | None:
+    messages = state.get("messages", [])
+    last_human = None
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            last_human = msg
+            break
+    if not last_human or not last_human.content:
+        return None
+
+    text = str(last_human.content).lower()
+    tokens = set(re.findall(r"[a-z]+", text))
+
+    if tokens & NUTRITION_KEYWORDS:
+        return None
+    for keyword in NUTRITION_KEYWORDS:
+        if keyword in text:
+            return None
+
+    return {"jump_to": "end", "messages": [AIMessage(content=FRIENDLY_REJECTION)]}
+
+
+@before_model(can_jump_to=["end"])
+def prompt_injection_guardrail(state: AgentState, runtime: Runtime) -> dict | None:
+    messages = state.get("messages", [])
+    last_human = None
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            last_human = msg
+            break
+    if not last_human or not last_human.content:
+        return None
+
+    text = str(last_human.content)
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return {"jump_to": "end", "messages": [AIMessage(content=INJECTION_REJECTION)]}
+    return None
+
+
+@after_model
+def content_safety_guardrail(state: AgentState, runtime: Runtime) -> dict | None:
+    messages = state.get("messages", [])
+    if not messages:
+        return None
+
+    last_ai = messages[-1]
+    if not isinstance(last_ai, AIMessage) or not last_ai.content:
+        return None
+    if last_ai.tool_calls:
+        return None
+
+    content = str(last_ai.content)
+
+    for pattern in HARMFUL_CONTENT_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            return {"messages": [AIMessage(
+                content=HARMFUL_CONTENT_REPLACEMENT + MEDICAL_DISCLAIMER,
+                id=last_ai.id,
+            )]}
+
+    for pattern in MEDICAL_ADVICE_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            return {"messages": [AIMessage(
+                content=content + MEDICAL_DISCLAIMER,
+                id=last_ai.id,
+            )]}
+
+    return None
+
+
+# ── Built-in middleware instances ────────────────────────────────────────
+
+pii_email = PIIMiddleware("email", strategy="redact", apply_to_input=True, apply_to_output=True)
+pii_credit_card = PIIMiddleware("credit_card", strategy="redact", apply_to_input=True, apply_to_output=True)
+tool_call_limiter = ToolCallLimitMiddleware(run_limit=15, exit_behavior="end")
+model_call_limiter = ModelCallLimitMiddleware(run_limit=20, exit_behavior="end")
+
+guardrails = [
+    topic_guardrail,
+    prompt_injection_guardrail,
+    pii_email,
+    pii_credit_card,
+    content_safety_guardrail,
+    tool_call_limiter,
+    model_call_limiter,
+]
 
 
 @tool
@@ -107,6 +288,10 @@ ddg_search = DuckDuckGoSearchResults(num_results=5)
 
 @cl.on_chat_start
 async def on_start():
+    memory = MemorySaver()
+    thread_id = cl.context.session.id
+    cl.user_session.set("thread_id", thread_id)
+
     llm = ChatAnthropic(
         model=os.environ["ANTHROPIC_MODEL"],
         temperature=0,
@@ -145,7 +330,7 @@ async def on_start():
         - Only return get_calories results that match the requested food — ignore unrelated matches.
         - If no data is found after searching, say so rather than guessing.
         """,
-        name="calorie_agent_with_search"
+        name="calorie_agent_with_search",
     )
 
     healthy_breakfast_planner_agent = create_agent(
@@ -156,7 +341,7 @@ async def on_start():
         Given the user's preferences prompt, come up with different vegetarian (not vegan) breakfast meals that are healthy and fit for a busy person.
         * Explicitly mention the meal's names in your response along with a short summary of why this is a healthy choice.
         """,
-        name="healthy_breakfast_planner"
+        name="healthy_breakfast_planner",
     )
 
     breakfast_price_checker_agent = create_agent(
@@ -177,7 +362,9 @@ async def on_start():
         - Each ingredient with its calories and approximate price
         - Estimated total cost per serving
         """,
-        name="breakfast_price_checker"
+        name="breakfast_price_checker",
+        checkpointer=memory,
+        middleware=guardrails,
     )
 
     async def _calorie_calculator(query: str) -> str:
@@ -219,6 +406,8 @@ async def on_start():
         Another agent will handle pricing — just focus on meals and calories.
         """,
         name="breakfast_advisor",
+        checkpointer=memory,
+        middleware=guardrails,
     )
 
     cl.user_session.set("breakfast_advisor", breakfast_advisor_agent)
@@ -226,14 +415,14 @@ async def on_start():
     await cl.Message(content=f"Welcome to Nutrition").send()
 
 
-async def stream_agent(agent, input_text, msg):
+async def stream_agent(agent, input_text, msg, config=None):
     """Stream an agent's response to a Chainlit message and return the full text."""
     tool_steps = {}
     full_output = ""
 
     async for event in agent.astream_events(
         {"messages": [{"role": "user", "content": input_text}]},
-        config={},
+        config=config or {},
         version="v2",
     ):
         if event["event"] == "on_tool_start":
@@ -269,13 +458,17 @@ async def stream_agent(agent, input_text, msg):
 async def main(message: cl.Message):
     breakfast_advisor = cl.user_session.get("breakfast_advisor")
     price_checker = cl.user_session.get("price_checker")
+    thread_id = cl.user_session.get("thread_id")
+    advisor_config = {"configurable": {"thread_id": f"{thread_id}_advisor"}}
+    price_config = {"configurable": {"thread_id": f"{thread_id}_price"}}
 
     # Step 1: Breakfast advisor plans meals with calories
     # Use ainvoke to get clean final output (streaming captures all sub-agent text)
     msg1 = cl.Message(content="Planning meals and looking up calories...")
     await msg1.send()
     result = await breakfast_advisor.ainvoke(
-        {"messages": [{"role": "user", "content": message.content}]}
+        {"messages": [{"role": "user", "content": message.content}]},
+        config=advisor_config,
     )
     raw_content = result["messages"][-1].content
     if isinstance(raw_content, list):
@@ -288,6 +481,10 @@ async def main(message: cl.Message):
     msg1.content = advisor_output
     await msg1.update()
 
+    # If a guardrail rejected the input, don't proceed to price checker
+    if advisor_output.strip() in GUARDRAIL_MESSAGES:
+        return
+
     # Step 2: Hand off to price checker with explicit instruction
     price_input = (
         "Search for the current grocery prices of each ingredient in these meals "
@@ -296,7 +493,7 @@ async def main(message: cl.Message):
     )
     msg2 = cl.Message(content="")
     await msg2.send()
-    await stream_agent(price_checker, price_input, msg2)
+    await stream_agent(price_checker, price_input, msg2, config=price_config)
 
 
 @cl.on_chat_end
